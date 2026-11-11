@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dot Grid — Push</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #fff; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* ───────── 설정 ───────── */
+const CFG = {
+  cell: 100,          // 그리드 간격 (100 × 100 px)
+  dot: 50,            // 기준 점 지름 (px)
+  minScale: 0.30,     // 30%
+  maxScale: 1.30,     // 130%
+  bigDiameter: 500,   // 클릭한 점이 커지는 지름 (px)
+  red: [255, 0, 0],   // 활성 배경
+  charge: 0.07,       // 터지기 전 웅크리는 시간 (s)
+  // 임팩트 프레임: 모든 움직임을 멈추고(히트스톱) 반전된 2톤 컷을 연달아 보여준 뒤 폭발
+  impact: [
+    { bg: '#000', fg: '#fff', t: 0.070, zoom: 1.04 },
+    { bg: '#fff', fg: '#000', t: 0.050, zoom: 1.00 },
+    { bg: '#000', fg: '#fff', t: 0.035, zoom: 1.02 },
+  ],
+  speedLines: 110,    // 집중선 개수
+  shockK: 5.5,        // 충격파 속도 — 클수록 초반에 더 확 퍼짐
+  shoveKick: 13,      // 밀쳐지는 초기 속도 배율
+  shake: 22,          // 화면 흔들림 세기 (px)
+};
+/* 스프링 [강성, 감쇠] */
+const SPR = {
+  calm:   [70, 16],   // 원래대로 돌아갈 때 — 부드럽게
+  shove:  [40, 12],   // 밀쳐질 때 — 확 날아갔다 살짝 되돌아오며 느려짐
+  pop:    [80, 14],   // 큰 점 팽창
+  charge: [420, 34],  // 웅크림
+  pull:   [220, 26],  // 터지기 직전 빨려 들어감
+};
+const WHITE = [255, 255, 255], BLACK = [0, 0, 0];
+const TAU = Math.PI * 2;
+
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+let dots = [];
+const cache = new Map();
+
+let sel = -1, active = false, phase = 'idle', chargeT = 0;
+let shockOn = false, shockR = 0, shockMax = 0, shockCx = 0, shockCy = 0;
+let bgR = 0, bgMax = 0, bgCx = 0, bgCy = 0;
+let shakeAmp = 0;
+let impactT = 0, impactIdx = -1, impactLines = [];
+let raf = 0, last = 0;
+
+function hsv(h) {
+  const f = n => { const k = (n + h / 60) % 6; return 255 * (1 - Math.max(0, Math.min(k, 4 - k, 1))); };
+  return [f(5), f(3), f(1)];
+}
+function newRand() {
+  return { s: CFG.minScale + Math.random() * (CFG.maxScale - CFG.minScale), hue: Math.random() * 360 };
+}
+const baseR = d => CFG.dot * d.rnd.s / 2;
+function setT(d, x, y, r, spr) { d.tx = x; d.ty = y; d.tr = r; d.k = spr[0]; d.c = spr[1]; }
+
+/* ───────── 그리드 ───────── */
+function build() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cvs.width = Math.round(W * DPR); cvs.height = Math.round(H * DPR);
+
+  const c = CFG.cell, cx = W / 2, cy = H / 2;
+  const nx = Math.ceil(cx / c) + 1, ny = Math.ceil(cy / c) + 1;
+  dots = [];
+  for (let j = -ny; j <= ny; j++) {
+    for (let i = -nx; i <= nx; i++) {
+      const key = i + ',' + j;
+      let r = cache.get(key);
+      if (!r) { r = newRand(); cache.set(key, r); }
+      const hx = cx + i * c, hy = cy + j * c;
+      const base = hsv(r.hue);
+      const d = { key, rnd: r, base, col: base.slice(), hx, hy, x: hx, y: hy, vx: 0, vy: 0, r: 0, vr: 0,
+                  armed: false, nx: hx, ny: hy, nr: 0, delay: Math.hypot(i, j) * 0.035 };
+      setT(d, hx, hy, baseR(d), SPR.calm);
+      dots.push(d);
+    }
+  }
+  sel = -1; active = false; phase = 'idle'; shockOn = false; bgR = 0; shakeAmp = 0;
+  kick();
+}
+
+function setBgCenter(x, y) {
+  bgCx = x; bgCy = y;
+  bgMax = Math.max(Math.hypot(x, y), Math.hypot(W - x, y), Math.hypot(x, H - y), Math.hypot(W - x, H - y)) + 2;
+}
+
+/* ───────── 1. 웅크림: 점이 검게 수축하고 주변이 살짝 빨려 들어감 ───────── */
+function select(k) {
+  if (active && sel >= 0 && sel !== k) dots[sel].dark = true;   // 이전 큰 점은 충격파에 맞을 때까지 검게
+  sel = k; active = true; phase = 'charge'; chargeT = CFG.charge; shockOn = false;
+  dots[k].dark = false;
+  const S = dots[k];
+  for (const d of dots) {
+    d.armed = false;
+    if (d === S) { setT(d, d.hx, d.hy, baseR(d) * 0.5, SPR.charge); continue; }
+    const dx = d.x - S.hx, dy = d.y - S.hy, dist = Math.hypot(dx, dy) || 1;
+    const q = dist / 280, pull = 16 * Math.exp(-q * q);
+    setT(d, d.x - dx / dist * pull, d.y - dy / dist * pull, d.tr, SPR.pull);
+  }
+  kick();
+}
+
+/* ───────── 2. 임팩트 프레임 ───────── */
+function startImpact() { phase = 'impact'; impactT = 0; impactIdx = -1; }
+
+function makeLines() {
+  const big = CFG.bigDiameter / 2, L = [];
+  for (let i = 0; i < CFG.speedLines; i++) {
+    L.push({ a: Math.random() * TAU, w: 0.003 + Math.random() * 0.02, r0: big * (1.18 + Math.random() * 1.0) });
+  }
+  return L;
+}
+
+function drawImpact(f) {
+  const S = dots[sel], big = CFG.bigDiameter / 2, cx = S.hx, cy = S.hy;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = f.bg;
+  ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(cx, cy); ctx.scale(f.zoom, f.zoom); ctx.translate(-cx, -cy);
+  ctx.fillStyle = f.fg;
+  // 멈춘 장면의 실루엣
+  ctx.beginPath();
+  for (const d of dots) {
+    if (d === S || d.r < 0.4) continue;
+    ctx.moveTo(d.x + d.r, d.y); ctx.arc(d.x, d.y, d.r, 0, TAU);
+  }
+  ctx.fill();
+  // 집중선
+  const R = Math.hypot(W, H) * 1.2;
+  ctx.beginPath();
+  for (const l of impactLines) {
+    ctx.moveTo(cx + Math.cos(l.a) * l.r0, cy + Math.sin(l.a) * l.r0);
+    ctx.lineTo(cx + Math.cos(l.a - l.w) * R, cy + Math.sin(l.a - l.w) * R);
+    ctx.lineTo(cx + Math.cos(l.a + l.w) * R, cy + Math.sin(l.a + l.w) * R);
+    ctx.closePath();
+  }
+  ctx.fill();
+  // 터진 순간의 원
+  ctx.beginPath(); ctx.arc(cx, cy, big * 1.08, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+/* ───────── 3. 폭발: 큰 점 팽창 + 충격파 시작 ───────── */
+function explode() {
+  phase = 'live';
+  const S = dots[sel];
+  const big = CFG.bigDiameter / 2;
+  S.r = Math.max(S.r, big * 0.45);        // 임팩트 컷에서 이어지도록 이미 꽤 큰 상태로 시작
+  const A = big * 1.05, s = A / 0.36;     // 밀림 거리 / 영향 반경
+  let mx = 0;
+  for (let k = 0; k < dots.length; k++) {
+    const d = dots[k];
+    if (k === sel) {
+      setT(d, d.hx, d.hy, big, SPR.pop);
+      d.vr = (big - d.r) * 12;            // 초반에 확
+      d.armed = false;
+      continue;
+    }
+    const dx = d.hx - S.hx, dy = d.hy - S.hy, dist = Math.hypot(dx, dy) || 1;
+    const q = dist / s, p = A * Math.exp(-q * q);
+    d.nx = d.hx + dx / dist * p; d.ny = d.hy + dy / dist * p; d.nr = baseR(d);
+    d.armed = true;
+    mx = Math.max(mx, Math.hypot(d.x - S.hx, d.y - S.hy));
+  }
+  shockCx = S.hx; shockCy = S.hy; shockR = 0; shockMax = mx + 60; shockOn = true;
+  if (bgR <= 0.5) setBgCenter(S.hx, S.hy);
+  else if (bgR >= bgMax - 1) { setBgCenter(S.hx, S.hy); bgR = bgMax; }
+  shakeAmp = CFG.shake;
+}
+
+/* ───────── 4. 충격파가 닿은 점: 바깥으로 내동댕이 ───────── */
+function hitDot(d) {
+  if (d.dark) d.col = WHITE.slice();   // 이전 큰 점: 맞는 순간 흰색으로 튕겨나감
+  d.armed = false; d.dark = false;
+  setT(d, d.nx, d.ny, d.nr, SPR.shove);
+  d.vx = (d.tx - d.x) * CFG.shoveKick;
+  d.vy = (d.ty - d.y) * CFG.shoveKick;
+  d.vr = d.r > d.tr * 1.5 ? (d.tr - d.r) * 10 : -d.r * 4.5;   // 맞는 순간 움찔
+}
+
+function release() {
+  if (!active) return;
+  active = false; phase = 'idle'; shockOn = false;
+  if (sel >= 0 && bgR >= bgMax - 1) { setBgCenter(dots[sel].hx, dots[sel].hy); bgR = bgMax; }
+  for (const d of dots) { d.armed = false; d.dark = false; setT(d, d.hx, d.hy, baseR(d), SPR.calm); }
+  kick();
+}
+
+function reshuffle() {
+  cache.clear();
+  for (let k = 0; k < dots.length; k++) {
+    const d = dots[k];
+    d.rnd.s = CFG.minScale + Math.random() * (CFG.maxScale - CFG.minScale);
+    d.rnd.hue = Math.random() * 360;
+    d.base = hsv(d.rnd.hue);
+    cache.set(d.key, d.rnd);
+    d.nr = baseR(d);
+    if (!(active && k === sel)) d.tr = baseR(d);
+  }
+  kick();
+}
+
+/* ───────── 루프 ───────── */
+function kick() { if (!raf) { last = performance.now(); raf = requestAnimationFrame(frame); } }
+
+function frame(now) {
+  const dt = Math.min(0.033, Math.max(0.001, (now - last) / 1000));
+  last = now;
+  let busy = false;
+
+  if (phase === 'charge') { chargeT -= dt; busy = true; if (chargeT <= 0) startImpact(); }
+
+  // 히트스톱: 임팩트 프레임 동안은 아무것도 움직이지 않음
+  if (phase === 'impact') {
+    impactT += dt;
+    let acc = 0, idx = -1;
+    for (let i = 0; i < CFG.impact.length; i++) { acc += CFG.impact[i].t; if (impactT < acc) { idx = i; break; } }
+    if (idx >= 0) {
+      if (idx !== impactIdx) { impactIdx = idx; impactLines = makeLines(); }
+      drawImpact(CFG.impact[idx]);
+      raf = requestAnimationFrame(frame);
+      return;
+    }
+    explode();
+  }
+
+  // 충격파: 초반에 확 퍼지고 갈수록 느려짐
+  if (shockOn) {
+    shockR += (shockMax * 1.08 - shockR) * (1 - Math.exp(-CFG.shockK * dt));
+    if (shockR >= shockMax) { shockR = shockMax; shockOn = false; }
+    busy = true;
+  }
+
+  // 레드 배경: 첫 클릭은 충격파와 같은 원으로 번짐, 해제 시 점으로 수렴
+  if (active && phase === 'live') {
+    if (shockOn && bgCx === shockCx && bgCy === shockCy) bgR = Math.max(bgR, shockR);
+    else bgR += (bgMax * 1.08 - bgR) * (1 - Math.exp(-CFG.shockK * dt));
+    bgR = Math.min(bgMax, bgR);
+    if (bgR < bgMax) busy = true;
+  } else if (!active) {
+    bgR += (-160 - bgR) * (1 - Math.exp(-4.6 * dt));
+    bgR = Math.max(0, bgR);
+    if (bgR > 0) busy = true; else if (sel >= 0) sel = -1;
+  }
+
+  if (shakeAmp > 0) { shakeAmp *= Math.exp(-9 * dt); if (shakeAmp < 0.15) shakeAmp = 0; busy = true; }
+
+  const kc = 1 - Math.exp(-16 * dt), kcSel = 1 - Math.exp(-30 * dt);
+  for (let k = 0; k < dots.length; k++) {
+    const d = dots[k];
+    if (d.delay > 0) { d.delay -= dt; busy = true; continue; }
+
+    if (d.armed && (!shockOn || Math.hypot(d.x - shockCx, d.y - shockCy) <= shockR)) hitDot(d);
+
+    d.vx += ((d.tx - d.x) * d.k - d.vx * d.c) * dt;
+    d.vy += ((d.ty - d.y) * d.k - d.vy * d.c) * dt;
+    d.vr += ((d.tr - d.r) * d.k - d.vr * d.c) * dt;
+    d.x += d.vx * dt; d.y += d.vy * dt; d.r += d.vr * dt;
+    if (d.r < 0.3) { d.r = 0.3; if (d.vr < 0) d.vr = 0; }
+
+    const covered = bgR > 0.5 && Math.hypot(d.x - bgCx, d.y - bgCy) <= bgR;
+    const isSel = (k === sel && (active || covered)) || d.dark;
+    const tgt = isSel ? BLACK : covered ? WHITE : d.base;
+    const kk = isSel ? kcSel : kc;
+    let cd = 0;
+    for (let n = 0; n < 3; n++) { d.col[n] += (tgt[n] - d.col[n]) * kk; cd += Math.abs(tgt[n] - d.col[n]); }
+
+    if (d.armed || Math.abs(d.vx) + Math.abs(d.vy) + Math.abs(d.vr) > 0.02 ||
+        Math.abs(d.tx - d.x) + Math.abs(d.ty - d.y) + Math.abs(d.tr - d.r) > 0.05 || cd > 0.6) busy = true;
+  }
+
+  draw();
+  raf = busy ? requestAnimationFrame(frame) : 0;
+}
+
+function rgb(c) { return 'rgb(' + (c[0] | 0) + ',' + (c[1] | 0) + ',' + (c[2] | 0) + ')'; }
+
+function draw() {
+  const sx = shakeAmp ? (Math.random() * 2 - 1) * shakeAmp : 0;
+  const sy = shakeAmp ? (Math.random() * 2 - 1) * shakeAmp : 0;
+  ctx.setTransform(DPR, 0, 0, DPR, sx * DPR, sy * DPR);
+  const M = 60;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(-M, -M, W + 2 * M, H + 2 * M);
+  if (bgR > 0.5) {
+    ctx.fillStyle = rgb(CFG.red);
+    if (bgR >= bgMax - 1) ctx.fillRect(-M, -M, W + 2 * M, H + 2 * M);
+    else { ctx.beginPath(); ctx.arc(bgCx, bgCy, bgR, 0, TAU); ctx.fill(); }
+  }
+  for (let k = 0; k < dots.length; k++) if (k !== sel) dot(dots[k], true);
+  if (sel >= 0) dot(dots[sel], false);
+}
+
+/* 빠르게 날아가는 점은 진행 방향으로 늘어남 */
+function dot(d, stretch) {
+  const m = d.r * 2.2;
+  if (d.r < 0.4 || d.x + m < -60 || d.y + m < -60 || d.x - m > W + 60 || d.y - m > H + 60) return;
+  ctx.fillStyle = rgb(d.col);
+  ctx.beginPath();
+  const sp = Math.hypot(d.vx, d.vy);
+  if (stretch && sp > 40) {
+    const st = 1 + Math.min(sp / 1600, 1.1);
+    ctx.ellipse(d.x, d.y, d.r * st, d.r / Math.sqrt(st), Math.atan2(d.vy, d.vx), 0, TAU);
+  } else {
+    ctx.arc(d.x, d.y, d.r, 0, TAU);
+  }
+  ctx.fill();
+}
+
+/* ───────── 입력 ───────── */
+function hit(px, py) {
+  if (sel >= 0 && active) { const S = dots[sel]; if (Math.hypot(px - S.x, py - S.y) <= Math.max(S.r, 14)) return sel; }
+  let best = -1, bd = Infinity;
+  for (let k = 0; k < dots.length; k++) {
+    const d = dots[k];
+    const dd = Math.hypot(px - d.x, py - d.y);
+    if (dd <= Math.max(d.r, 14) && dd < bd) { bd = dd; best = k; }
+  }
+  return best;
+}
+
+cvs.addEventListener('pointerdown', e => {
+  const k = hit(e.clientX, e.clientY);
+  if (k < 0 || (active && k === sel)) release();
+  else select(k);
+});
+cvs.addEventListener('pointermove', e => {
+  cvs.style.cursor = hit(e.clientX, e.clientY) >= 0 ? 'pointer' : 'default';
+});
+addEventListener('keydown', e => {
+  if (e.key === 'Escape') release();
+  if (e.key === 'r' || e.key === 'R') reshuffle();
+});
+let rt = 0;
+addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(build, 150); });
+
+build();
+</script>
+</body>
+</html>
